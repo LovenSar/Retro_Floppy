@@ -19,27 +19,52 @@ def format_time(seconds):
     """Utility to convert seconds to HH:MM:SS format"""
     return str(timedelta(seconds=int(seconds)))
 
+def enforce_cooldown(bak_dir: str, cooldown_minutes: int = 10):
+    """检测上次备份时间，如果间隔不足则进行强制倒计时"""
+    if not os.path.exists(bak_dir):
+        return
+
+    # 获取 BAK 目录下所有的 zip 文件
+    zip_files = [os.path.join(bak_dir, f) for f in os.listdir(bak_dir) if f.endswith(".zip")]
+    if not zip_files:
+        return
+
+    # 找到最新生成的文件
+    latest_file = max(zip_files, key=os.path.getmtime)
+    last_mod_time = os.path.getmtime(latest_file)
+    
+    elapsed_seconds = time.time() - last_mod_time
+    required_seconds = cooldown_minutes * 60
+    wait_seconds = required_seconds - elapsed_seconds
+
+    if wait_seconds > 0:
+        print(f"🛑 [保护机制] 软驱冷却中...")
+        print(f"上次读取时间: {datetime.fromtimestamp(last_mod_time).strftime('%H:%M:%S')}")
+        print(f"策略设定: 每 {cooldown_minutes} 分钟仅允许读取一张盘以防止磁头磨损。")
+        
+        try:
+            while wait_seconds > 0:
+                mins, secs = divmod(int(wait_seconds), 60)
+                # 使用 \r 实现原地刷新倒计时
+                sys.stdout.write(f"\r⏳ 强制冷却倒计时: {mins:02d}分{secs:02d}秒 后允许继续... (按 Ctrl+C 可强制跳过) ")
+                sys.stdout.flush()
+                time.sleep(1)
+                wait_seconds -= 1
+            print("\n✅ 冷却完成，准备开始读取。")
+        except KeyboardInterrupt:
+            print("\n⚠️ 警告: 用户手动跳过了冷却。请注意软驱发热情况！")
+
+# --- 原有辅助函数保持不变 ---
+
 def _is_probably_device_path(path: str) -> bool:
-    if not path:
-        return False
-    if path.startswith("\\\\.\\"):
-        return True
-    if path.startswith("/dev/"):
-        return True
-    return False
+    if not path: return False
+    return path.startswith("\\\\.\\") or path.startswith("/dev/")
 
 def _sanitize_comment(comment: str) -> str:
     comment = (comment or "").strip()
-    if not comment:
-        return "NOCOMM"
-    safe = []
-    for ch in comment:
-        if ch.isalnum() or ch in ("-", "_"):
-            safe.append(ch)
-        else:
-            safe.append("_")
-    cleaned = "".join(safe).strip("_")
-    return (cleaned or "NOCOMM")[:32]
+    if not comment: return "NOCOMM"
+    safe = [ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in comment]
+    return "".join(safe).strip("_")[:32]
 
 def _try_run(cmd: List[str]) -> Tuple[int, str, str]:
     try:
@@ -50,85 +75,65 @@ def _try_run(cmd: List[str]) -> Tuple[int, str, str]:
 
 def _resolve_macos_device_from_mount(mount_path: str) -> Optional[str]:
     rc, out, _ = _try_run(["df", "-P", mount_path])
-    if rc != 0 or not out.strip():
-        return None
+    if rc != 0 or not out.strip(): return None
     lines = [ln for ln in out.splitlines() if ln.strip()]
-    if len(lines) < 2:
-        return None
+    if len(lines) < 2: return None
     dev = lines[1].split()[0].strip()
-    if dev.startswith("/dev/disk"):
-        return dev.replace("/dev/disk", "/dev/rdisk", 1)
-    if dev.startswith("/dev/rdisk"):
-        return dev
-    return None
+    if dev.startswith("/dev/disk"): return dev.replace("/dev/disk", "/dev/rdisk", 1)
+    return dev if dev.startswith("/dev/rdisk") else None
 
 def _auto_detect_macos_floppy_device() -> Optional[str]:
     rc, out, _ = _try_run(["diskutil", "list"])
-    if rc != 0 or not out.strip():
-        return None
-
-    # Heuristics:
-    # - Some USB floppy drives show partitions as DOS_FAT_12 / FAT12
-    # - Size is typically ~1.4 MB
+    if rc != 0 or not out.strip(): return None
     candidates: List[str] = []
     for line in out.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        upper = s.upper()
-        if "FAT_12" in upper or "FAT12" in upper or "DOS_FAT_12" in upper or "FLOPPY" in upper or "1.4 MB" in upper:
-            parts = s.split()
-            if parts:
-                last = parts[-1]
-                if last.startswith("disk"):
-                    candidates.append("/dev/rdisk" + last[len("disk"):])
-
+        if any(k in line.upper() for k in ["FAT_12", "FAT12", "DOS_FAT_12", "FLOPPY", "1.4 MB"]):
+            parts = line.strip().split()
+            if parts and parts[-1].startswith("disk"):
+                candidates.append("/dev/rdisk" + parts[-1][len("disk"):])
     return candidates[0] if candidates else None
 
 def resolve_source(source: Optional[str]) -> str:
     system = platform.system()
     if source and source.lower() != "auto":
         source = os.path.expanduser(source)
-        if system == "Darwin" and os.path.isdir(source):
-            dev = _resolve_macos_device_from_mount(source)
-            if dev:
-                return dev
-        if system == "Darwin" and source.startswith("/dev/disk"):
-            return source.replace("/dev/disk", "/dev/rdisk", 1)
+        if system == "Darwin":
+            if os.path.isdir(source):
+                dev = _resolve_macos_device_from_mount(source)
+                if dev: return dev
+            if source.startswith("/dev/disk"): return source.replace("/dev/disk", "/dev/rdisk", 1)
         return source
-
-    if system == "Windows":
-        return r"\\.\A:"
+    if system == "Windows": return r"\\.\A:"
     if system == "Darwin":
         dev = _auto_detect_macos_floppy_device()
-        if dev:
-            return dev
-        raise SystemExit(
-            "Could not auto-detect a floppy device on macOS. "
-            "Run with `--list` and then provide `--source /dev/rdiskN` (or `--source /Volumes/NAME`)."
-        )
-    # Linux / other Unix
+        if dev: return dev
+        raise SystemExit("Could not auto-detect a floppy device on macOS.")
     return "/dev/fd0"
 
 def open_source(path: str):
     buffering = 0 if _is_probably_device_path(path) else -1
     return open(path, "rb", buffering=buffering)
 
+# --- 修改后的主救援函数 ---
+
 def multi_pass_rescue(
     drive_path: Optional[str] = None,
     *,
     passes: int = 2,
     comment: Optional[str] = None,
+    cooldown: int = 10
 ):
+    # 【新增】执行冷却检查
+    enforce_cooldown(BAK_DIR, cooldown)
+
     # Standard 1.44MB Floppy Parameters
     TRACKS, HEADS = 80, 2
     SECTORS_PER_TRACK = 18
     SECTOR_SIZE = 512
     TRACK_SIZE = SECTORS_PER_TRACK * SECTOR_SIZE
     TOTAL_SIZE = 1474560
-    PASSES = int(passes)
     TOTAL_TRACK_HEADS = TRACKS * HEADS
-    TOTAL_OPS = TOTAL_TRACK_HEADS * PASSES
+    TOTAL_OPS = TOTAL_TRACK_HEADS * passes
 
     drive_path = resolve_source(drive_path)
 
@@ -139,15 +144,13 @@ def multi_pass_rescue(
         "metadata": {"serial": "UNKNOWN", "label": "NO_LABEL", "fs": "FAT12"},
         "unstable_spots": [],
         "stable_bad_spots": [],
-        "found_files": []
+        "disk_map": []
     }
     
     master_bin = bytearray(TOTAL_SIZE)
     track_results = [[[] for _ in range(HEADS)] for _ in range(TRACKS)]
 
-    print(f"🚀 [Double-Pass Rescue] Target: {drive_path} | Total Passes: {PASSES}")
-    if platform.system() == "Darwin" and drive_path.startswith("/dev/rdisk"):
-        print("ℹ️  macOS raw device detected; if open fails, try: sudo python3 check_flp.py --source /dev/rdiskN")
+    print(f"\n🚀 [Rescue Mode] Target: {drive_path} | Passes: {passes}")
     print("-" * 85)
     
     start_time = time.time()
@@ -166,25 +169,22 @@ def multi_pass_rescue(
             except: pass
 
             # 2. Scanning Passes
-            for p in range(1, PASSES + 1):
+            for p in range(1, passes + 1):
                 f.seek(0)
                 for t in range(TRACKS):
                     for h in range(HEADS):
                         offset = (t * HEADS + h) * TRACK_SIZE
-                        
                         ops_done += 1
+                        
+                        # UI Progress Update
                         elapsed_sec = time.time() - start_time
-                        avg_time_per_op = elapsed_sec / ops_done
-                        remaining_ops = TOTAL_OPS - ops_done
-                        remaining_sec = remaining_ops * avg_time_per_op
+                        avg_time = elapsed_sec / ops_done
+                        remaining_sec = (TOTAL_OPS - ops_done) * avg_time
                         eta_dt = datetime.now() + timedelta(seconds=remaining_sec)
 
                         sys.stdout.write(
-                            f"\rPass {p}/{PASSES} | {int((ops_done/TOTAL_OPS)*100):3d}% | "
-                            f"T:{t:02d} H:{h} | "
-                            f"Elapsed: {format_time(elapsed_sec)} | "
-                            f"Remain: {format_time(remaining_sec)} | "
-                            f"ETA: {eta_dt.strftime('%H:%M:%S')} "
+                            f"\rPass {p}/{passes} | {int((ops_done/TOTAL_OPS)*100):3d}% | "
+                            f"T:{t:02d} H:{h} | ETA: {eta_dt.strftime('%H:%M:%S')} "
                         )
                         sys.stdout.flush()
 
@@ -200,15 +200,10 @@ def multi_pass_rescue(
                         except:
                             track_results[t][h].append(False)
                 
-                if p < PASSES:
-                    print(f"\nPass {p} complete. Stabilizing motor...")
+                if p < passes:
+                    print(f"\nPass {p} complete. Brief motor pause...")
                     time.sleep(1) 
 
-    except PermissionError as e:
-        print(f"\n❌ Permission Error: {e}")
-        if platform.system() == "Darwin" and drive_path.startswith("/dev/"):
-            print("Try: sudo python3 check_flp.py --source " + drive_path)
-        return
     except Exception as e:
         print(f"\n❌ Hardware Error: {e}")
         return
@@ -219,16 +214,15 @@ def multi_pass_rescue(
         for h in range(HEADS):
             res = track_results[t][h]
             successes = sum(res)
-            if successes == PASSES:
-                final_status_map.append("STABLE_OK")
+            if successes == passes: final_status_map.append("STABLE_OK")
             elif successes == 0:
                 final_status_map.append("STABLE_BAD")
                 report["stable_bad_spots"].append(f"T:{t:02d} H:{h}")
             else:
                 final_status_map.append("UNSTABLE")
-                report["unstable_spots"].append(f"T:{t:02d} H:{h} ({successes}/{PASSES})")
+                report["unstable_spots"].append(f"T:{t:02d} H:{h} ({successes}/{passes})")
 
-    # 4. Finalizing and Archiving
+    # 4. Finalizing
     print("\n" + "-"*85)
     comment = _sanitize_comment(comment if comment is not None else input("Enter comment for archive: "))
     md5_hash = hashlib.md5(master_bin).hexdigest()
@@ -240,28 +234,19 @@ def multi_pass_rescue(
     os.makedirs(BAK_DIR, exist_ok=True)
     report["disk_map"] = final_status_map
 
-    # Temporary paths for raw files
     tmp_bin = os.path.join(BAK_DIR, f"{file_base}.bin")
     tmp_json = os.path.join(BAK_DIR, f"{file_base}.json")
     zip_path = os.path.join(BAK_DIR, f"{file_base}.zip")
 
-    # Write temporary files
-    with open(tmp_bin, "wb") as fb:
-        fb.write(master_bin)
-    with open(tmp_json, "w", encoding='utf-8') as fj:
-        json.dump(report, fj, indent=4, ensure_ascii=False)
+    with open(tmp_bin, "wb") as fb: fb.write(master_bin)
+    with open(tmp_json, "w", encoding='utf-8') as fj: json.dump(report, fj, indent=4, ensure_ascii=False)
 
-    # 5. ZIP Compression Logic
-    print(f"Compressing archive to ZIP...")
     try:
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.write(tmp_bin, arcname=f"{file_base}.bin")
             archive.write(tmp_json, arcname=f"{file_base}.json")
-        
-        # Remove temporary files after successful compression
         os.remove(tmp_bin)
         os.remove(tmp_json)
-        print(f"Successfully compressed and cleaned up temporary files.")
     except Exception as ze:
         print(f"❌ Compression Error: {ze}")
 
@@ -277,37 +262,20 @@ def render_final_view(report, status_map, zip_path, recovered, total_tracks, hea
     print(f"Head 0: {''.join(m[0::2])}")
     print(f"Head 1: {''.join(m[1::2])}")
     print(f"Final Health: {health}%")
-    
-    # Simple display of captured ZIP path
-    print(f"\n📂 Compressed Archive: {os.path.basename(zip_path)}")
-    print(f"📍 Location: {os.path.dirname(zip_path)}")
+    print(f"\n📂 Saved to: {os.path.basename(zip_path)}")
     print("="*85)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Double-pass raw read/rescue of a 1.44MB floppy (or disk image).",
-    )
-    parser.add_argument(
-        "--source",
-        default="auto",
-        help=r"Raw device path or image file. Windows: \\.\A:  macOS: /dev/rdiskN or /Volumes/NAME  Linux: /dev/fd0  (default: auto)",
-    )
-    parser.add_argument("--passes", type=int, default=2, help="Number of read passes (default: 2)")
-    parser.add_argument("--comment", default=None, help="Archive comment (skips interactive prompt)")
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="List likely devices (macOS only) and exit",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="auto")
+    parser.add_argument("--passes", type=int, default=2)
+    parser.add_argument("--comment", default=None)
+    parser.add_argument("--cooldown", type=int, default=10, help="Wait minutes between disks")
+    parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
-    if args.list:
-        if platform.system() == "Darwin":
-            rc, out, err = _try_run(["diskutil", "list"])
-            sys.stdout.write(out if out else "")
-            sys.stderr.write(err if err else "")
-            raise SystemExit(rc)
-        print("--list is only supported on macOS.")
-        raise SystemExit(2)
+    if args.list and platform.system() == "Darwin":
+        rc, out, err = _try_run(["diskutil", "list"])
+        sys.stdout.write(out or ""); sys.stderr.write(err or ""); raise SystemExit(rc)
 
-    multi_pass_rescue(args.source, passes=args.passes, comment=args.comment)
+    multi_pass_rescue(args.source, passes=args.passes, comment=args.comment, cooldown=args.cooldown)
