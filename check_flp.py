@@ -270,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", default="auto")
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--comment", default=None)
-    parser.add_argument("--cooldown", type=int, default=10, help="Wait minutes between disks")
+    parser.add_argument("--cooldown", type=int, default=3, help="Wait minutes between disks")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
